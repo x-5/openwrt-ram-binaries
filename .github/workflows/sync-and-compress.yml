@@ -162,17 +162,18 @@ jobs:
           )
           
           # Release to latest tag
-          gh release delete latest --yes || true
+          gh release delete latest --yes 2>/dev/null || true
           git tag -d latest 2>/dev/null || true
           git push origin :refs/tags/latest 2>/dev/null || true
           
           gh release create latest dist/* \
             --title "${RELEASE_TITLE} (latest)" \
             --notes "${RELEASE_NOTES}" \
-            --clobber
+            --latest
           
           # Also tag specific version
           VERSION_TAG="nb-${NB_TAG#v}_ds-${DS_TAG#agent-}"
+          gh release delete "${VERSION_TAG}" --yes 2>/dev/null || true
           gh release create "${VERSION_TAG}" dist/* \
             --title "${RELEASE_TITLE}" \
             --notes "${RELEASE_NOTES}" || true

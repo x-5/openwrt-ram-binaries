@@ -1,0 +1,178 @@
+name: Sync Upstream and UPX Compress
+
+on:
+  schedule:
+    # Check upstream releases every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force build and release even if upstream versions have not changed'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-compress:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies and UPX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq tar xz-utils
+          
+          # Install latest UPX 5.x
+          UPX_VER=$(curl -sL https://api.github.com/repos/upx/upx/releases/latest | jq -r .tag_name | sed 's/^v//')
+          echo "Installing UPX version ${UPX_VER}..."
+          curl -sL "https://github.com/upx/upx/releases/download/v${UPX_VER}/upx-${UPX_VER}-amd64_linux.tar.xz" | sudo tar -xJ --strip-components=1 -C /usr/local/bin "upx-${UPX_VER}-amd64_linux/upx"
+          upx --version
+
+      - name: Check upstream versions
+        id: check_versions
+        run: |
+          NB_TAG=$(curl -sL https://api.github.com/repos/netbirdio/netbird/releases/latest | jq -r .tag_name)
+          DS_TAG=$(curl -sL https://api.github.com/repos/fev125/dstatus/releases/latest | jq -r .tag_name)
+          
+          if [ -z "$NB_TAG" ] || [ "$NB_TAG" = "null" ]; then
+            echo "::error::Failed to fetch NetBird latest release tag"
+            exit 1
+          fi
+          if [ -z "$DS_TAG" ] || [ "$DS_TAG" = "null" ]; then
+            echo "::error::Failed to fetch DStatus latest release tag"
+            exit 1
+          fi
+          
+          echo "Current upstream NetBird: $NB_TAG"
+          echo "Current upstream DStatus: $DS_TAG"
+          
+          echo "nb_tag=$NB_TAG" >> $GITHUB_OUTPUT
+          echo "nb_ver=${NB_TAG#v}" >> $GITHUB_OUTPUT
+          echo "ds_tag=$DS_TAG" >> $GITHUB_OUTPUT
+          
+          OLD_NB=""
+          OLD_DS=""
+          if [ -f "versions.json" ]; then
+            OLD_NB=$(jq -r '.netbird // empty' versions.json)
+            OLD_DS=$(jq -r '.dstatus // empty' versions.json)
+          fi
+          
+          echo "Recorded NetBird: $OLD_NB"
+          echo "Recorded DStatus: $OLD_DS"
+          
+          FORCE="${{ github.event.inputs.force }}"
+          if [ "$FORCE" = "true" ] || [ "$NB_TAG" != "$OLD_NB" ] || [ "$DS_TAG" != "$OLD_DS" ]; then
+            echo "need_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "need_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download, Extract and Compress Binaries
+        if: steps.check_versions.outputs.need_update == 'true'
+        run: |
+          NB_TAG="${{ steps.check_versions.outputs.nb_tag }}"
+          NB_VER="${{ steps.check_versions.outputs.nb_ver }}"
+          DS_TAG="${{ steps.check_versions.outputs.ds_tag }}"
+          
+          mkdir -p dist build_tmp
+          
+          echo "=== [1/4] Downloading NetBird ARMv6 ==="
+          curl -sL "https://github.com/netbirdio/netbird/releases/download/${NB_TAG}/netbird_${NB_VER}_linux_armv6.tar.gz" | tar -xz -C build_tmp netbird
+          mv build_tmp/netbird dist/netbird_linux_armv6
+          
+          echo "=== [2/4] Downloading NetBird MIPSEL Softfloat ==="
+          curl -sL "https://github.com/netbirdio/netbird/releases/download/${NB_TAG}/netbird_${NB_VER}_linux_mipsle_softfloat.tar.gz" | tar -xz -C build_tmp netbird
+          mv build_tmp/netbird dist/netbird_linux_mipsle
+          
+          echo "=== [3/4] Downloading DStatus ARM7 ==="
+          curl -sL "https://github.com/fev125/dstatus/releases/download/${DS_TAG}/dstatus-agent_linux_arm7" -o dist/dstatus-agent_linux_arm7
+          
+          echo "=== [4/4] Downloading DStatus MIPSEL ==="
+          curl -sL "https://github.com/fev125/dstatus/releases/download/${DS_TAG}/dstatus-agent_linux_mipsle" -o dist/dstatus-agent_linux_mipsle
+          
+          chmod +x dist/*
+          
+          echo "=== Original Binary Sizes ==="
+          ls -lh dist/
+          
+          echo "=== UPX Extreme Compression (--best --lzma) ==="
+          upx --best --lzma dist/netbird_linux_armv6
+          upx --best --lzma dist/netbird_linux_mipsle
+          upx --best --lzma dist/dstatus-agent_linux_arm7
+          upx --best --lzma dist/dstatus-agent_linux_mipsle
+          
+          echo "=== Compressed Binary Sizes ==="
+          ls -lh dist/
+          
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          cd ..
+
+      - name: Update versions.json in repository
+        if: steps.check_versions.outputs.need_update == 'true'
+        run: |
+          NB_TAG="${{ steps.check_versions.outputs.nb_tag }}"
+          DS_TAG="${{ steps.check_versions.outputs.ds_tag }}"
+          
+          jq -n --arg nb "$NB_TAG" --arg ds "$DS_TAG" \
+            '{"netbird": $nb, "dstatus": $ds, "updated_at": (now | todate)}' > versions.json
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          git commit -m "chore(sync): update upstream versions NetBird ${NB_TAG}, DStatus ${DS_TAG}" || true
+          git push origin main
+
+      - name: Publish GitHub Release (latest)
+        if: steps.check_versions.outputs.need_update == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NB_TAG="${{ steps.check_versions.outputs.nb_tag }}"
+          DS_TAG="${{ steps.check_versions.outputs.ds_tag }}"
+          RELEASE_TITLE="NetBird ${NB_TAG} | DStatus ${DS_TAG}"
+          RELEASE_NOTES=$(cat << EOF
+          ## OpenWrt RAM-Mode Pre-compressed Binaries
+
+          - **NetBird**: \`${NB_TAG}\`
+          - **DStatus**: \`${DS_TAG}\`
+          - **UPX Version**: $(upx --version | head -n 1)
+
+          ### Supported Architectures
+          * **ARMv7 / ARMv6** (e.g. Xiaomi CR8809, IPQ50xx):
+            * \`netbird_linux_armv6\` (~6.2 MB)
+            * \`dstatus-agent_linux_arm7\` (~2.6 MB)
+          * **MIPSEL Softfloat** (e.g. MediaTek MT7620, MT7628, MT7621):
+            * \`netbird_linux_mipsle\` (~6.1 MB)
+            * \`dstatus-agent_linux_mipsle\` (~2.6 MB)
+
+          ### Checksums
+          \`\`\`
+          $(cat dist/SHA256SUMS)
+          \`\`\`
+          EOF
+          )
+          
+          # Release to latest tag
+          gh release delete latest --yes || true
+          git tag -d latest 2>/dev/null || true
+          git push origin :refs/tags/latest 2>/dev/null || true
+          
+          gh release create latest dist/* \
+            --title "${RELEASE_TITLE} (latest)" \
+            --notes "${RELEASE_NOTES}" \
+            --clobber
+          
+          # Also tag specific version
+          VERSION_TAG="nb-${NB_TAG#v}_ds-${DS_TAG#agent-}"
+          gh release create "${VERSION_TAG}" dist/* \
+            --title "${RELEASE_TITLE}" \
+            --notes "${RELEASE_NOTES}" || true
